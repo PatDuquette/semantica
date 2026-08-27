@@ -750,6 +750,40 @@ class TestMCPGetGraphLoadsFromPath(unittest.TestCase):
             os.unlink(path)
 
 
+class TestRootMCPSessionLoadsFromPath(unittest.TestCase):
+    """The same contract for the root ``mcp`` package's session singleton.
+
+    ``semantica.mcp_server`` and the root ``mcp`` package are two entry points
+    onto the same graph, and Part 10 only covers the first. This is the sibling.
+    """
+
+    def test_get_graph_loads_kg_path(self):
+        """When SEMANTICA_KG_PATH is set, mcp.session.get_graph must load it."""
+        import mcp.session as session_mod
+
+        g = ContextGraph(advanced_analytics=False)
+        g.add_node("kg_node_1", "entity", label="Loaded from file")
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        try:
+            g.save_to_file(path)
+
+            original_graph = session_mod._graph
+            session_mod._graph = None
+            try:
+                with patch.dict(os.environ, {"SEMANTICA_KG_PATH": path}):
+                    loaded_graph = session_mod.get_graph()
+                    self.assertTrue(
+                        loaded_graph.has_node("kg_node_1"),
+                        "Graph must contain node from persisted file",
+                    )
+            finally:
+                session_mod._graph = original_graph
+        finally:
+            os.unlink(path)
+
+
 # ---------------------------------------------------------------------------
 # Part 11: update_node / delete_node smoke tests + decision sync
 # ---------------------------------------------------------------------------
