@@ -949,3 +949,75 @@ class TestBidirectionalPathFinding:
         from semantica.explorer.schemas import PathResponse
         r = PathResponse(source="A", target="B", algorithm="bfs", path=["A", "B"])
         assert r.directed is True
+
+
+class TestMappingGraphTraversal:
+    """A graph handed over as a plain mapping must be traversable.
+
+    ``GraphSession.build_graph_dict()`` returns ``{"entities": [...],
+    "relationships": [...]}`` and the Explorer's ``GET /api/graph/path`` route
+    passes that straight to PathFinder, so this is the shape every file-loaded
+    graph arrives in.
+    """
+
+    def setup_method(self):
+        self.finder = PathFinder()
+        self.mapping = {
+            "entities": [
+                {"id": "A", "type": "entity", "text": "A"},
+                {"id": "B", "type": "entity", "text": "B"},
+                {"id": "C", "type": "entity", "text": "C"},
+                {"id": "island", "type": "entity", "text": "island"},
+            ],
+            "relationships": [
+                {"source": "A", "target": "B", "type": "rel", "weight": 1.0},
+                {"source": "B", "target": "C", "type": "rel", "weight": 2.0},
+            ],
+        }
+
+    def test_node_lookup_uses_ids_not_mapping_keys(self):
+        graph = self.finder._coerce(self.mapping)
+        assert self.finder._node_exists(graph, "A") is True
+        assert self.finder._node_exists(graph, "island") is True
+        # The regression: a bare dict answers __contains__ against its own keys.
+        assert self.finder._node_exists(graph, "entities") is False
+        assert self.finder._node_exists(graph, "relationships") is False
+
+    def test_bfs_finds_a_multi_hop_path(self):
+        assert self.finder.bfs_shortest_path(self.mapping, "A", "C") == ["A", "B", "C"]
+
+    def test_dijkstra_finds_the_same_path(self):
+        assert self.finder.dijkstra_shortest_path(self.mapping, "A", "C") == ["A", "B", "C"]
+
+    def test_missing_node_still_raises(self):
+        with pytest.raises(ValueError):
+            self.finder.bfs_shortest_path(self.mapping, "A", "nope")
+
+    def test_direction_is_respected(self):
+        assert self.finder.bfs_shortest_path(self.mapping, "A", "C", directed=True) == ["A", "B", "C"]
+        # No reverse edge exists, so the directed search correctly finds nothing.
+        assert self.finder.bfs_shortest_path(self.mapping, "C", "A", directed=True) == []
+        # An isolated node is unreachable in either direction.
+        assert self.finder.bfs_shortest_path(self.mapping, "island", "A", directed=False) == []
+
+    def test_undirected_traverses_backwards(self):
+        assert self.finder.bfs_shortest_path(self.mapping, "C", "A", directed=False) == ["C", "B", "A"]
+
+    def test_edge_data_and_weights_survive(self):
+        graph = self.finder._coerce(self.mapping)
+        assert self.finder._get_edge_data(graph, "B", "C")["weight"] == 2.0
+        assert self.finder.path_length(self.mapping, ["A", "B", "C"]) == 3.0
+
+    def test_alternative_key_names_are_accepted(self):
+        """``{"nodes": ..., "edges": ...}`` is the other common serialisation."""
+        alt = {
+            "nodes": [{"id": "X"}, {"id": "Y"}],
+            "edges": [{"source": "X", "target": "Y", "weight": 1.0}],
+        }
+        assert self.finder.bfs_shortest_path(alt, "X", "Y") == ["X", "Y"]
+
+    def test_networkx_graphs_are_not_wrapped(self):
+        graph = nx.DiGraph()
+        graph.add_edge("A", "B")
+        assert self.finder._coerce(graph) is graph
+        assert self.finder.bfs_shortest_path(graph, "A", "B") == ["A", "B"]

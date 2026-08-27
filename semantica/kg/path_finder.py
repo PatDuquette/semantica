@@ -51,6 +51,75 @@ from ..utils.logging import get_logger
 from ..utils.progress_tracker import get_progress_tracker
 
 
+class _MappingGraph:
+    """Read-only graph view over a serialised ``{entities, relationships}`` mapping.
+
+    ``PathFinder`` duck-types its ``graph`` argument, and this module advertises
+    "graph compatibility with NetworkX and custom formats". A plain mapping is one
+    of those custom formats - it is what ``GraphSession.build_graph_dict()``
+    returns, and therefore what the Explorer's ``/api/graph/path`` route passes in
+    - but the private helpers below cannot read it:
+
+    * ``_node_exists`` finds ``__contains__`` first, so it tests node ids against
+      the mapping's **keys** (``"entities"``, ``"relationships"``) and reports
+      every real node missing.
+    * ``_get_neighbors`` finds neither ``neighbors`` nor ``get_neighbors``, so it
+      always returns ``[]``.
+    * ``_get_edge_data`` finds neither ``get_edge_data`` nor an ``edges``
+      attribute, so it always returns ``{}``.
+    * ``_make_undirected_view`` finds no ``to_undirected``, so ``directed=False``
+      silently behaves as ``directed=True``.
+
+    Fixing only the first would be worse than leaving it alone: lookup would
+    succeed and the search would then find no neighbours, turning "node not found"
+    into a confident "no path exists". Wrapping the mapping once gives every helper
+    the interface it already probes for, and needs no new dependency - this module
+    is deliberately stdlib-only.
+    """
+
+    _NODE_KEYS = ("entities", "nodes")
+    _EDGE_KEYS = ("relationships", "edges")
+
+    def __init__(self, mapping: Dict[str, Any], undirected: bool = False):
+        self._mapping = mapping
+        self._undirected = undirected
+        self._nodes: Set[str] = set()
+        self._adjacency: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
+        for key in self._NODE_KEYS:
+            for entity in mapping.get(key) or []:
+                node_id = entity.get("id") if isinstance(entity, dict) else entity
+                if node_id is not None:
+                    self._nodes.add(str(node_id))
+
+        for key in self._EDGE_KEYS:
+            for edge in mapping.get(key) or []:
+                if not isinstance(edge, dict):
+                    continue
+                source, target = edge.get("source"), edge.get("target")
+                if source is None or target is None:
+                    continue
+                source, target = str(source), str(target)
+                self._nodes.update((source, target))
+                self._adjacency[source][target] = edge
+                if undirected:
+                    self._adjacency[target].setdefault(source, edge)
+
+    def has_node(self, node: str) -> bool:
+        return node in self._nodes
+
+    def neighbors(self, node: str) -> List[str]:
+        return list(self._adjacency.get(node, {}))
+
+    def get_edge_data(self, u: str, v: str) -> Any:
+        return self._adjacency.get(u, {}).get(v, {})
+
+    def to_undirected(self) -> "_MappingGraph":
+        if self._undirected:
+            return self
+        return _MappingGraph(self._mapping, undirected=True)
+
+
 class PathFinder:
     """
     Path finding engine for knowledge graphs.
@@ -161,6 +230,7 @@ class PathFinder:
         ``excluded_nodes`` and ``excluded_edges`` are used internally by
         Yen's algorithm to model its temporary graph modifications.
         """
+        graph = self._coerce(graph)
         excluded_nodes = excluded_nodes or set()
         excluded_edges = excluded_edges or set()
 
@@ -251,6 +321,7 @@ class PathFinder:
         """
         try:
             self.logger.info(f"Finding A* path from {source} to {target}")
+            graph = self._coerce(graph)
             
             # Validate nodes exist
             if not self._node_exists(graph, source):
@@ -332,6 +403,7 @@ class PathFinder:
         """
         try:
             self.logger.info(f"Finding all shortest paths from {source}")
+            graph = self._coerce(graph)
             
             # Validate source exists
             if not self._node_exists(graph, source):
@@ -407,6 +479,7 @@ class PathFinder:
         """
         try:
             self.logger.info(f"Finding BFS shortest path from {source} to {target}")
+            graph = self._coerce(graph)
 
             # Validate nodes exist
             if not self._node_exists(graph, source):
@@ -464,6 +537,8 @@ class PathFinder:
         Raises:
             ValueError: If path is invalid
         """
+        graph = self._coerce(graph)
+
         if len(path) < 2:
             return 0.0
         
@@ -523,6 +598,8 @@ class PathFinder:
         Raises:
             ValueError: If parameters are invalid
         """
+        graph = self._coerce(graph)
+
         if k <= 0:
             raise ValueError("k must be positive")
         
@@ -611,6 +688,17 @@ class PathFinder:
 
         return False
     
+    def _coerce(self, graph: Any) -> Any:
+        """Wrap a serialised graph mapping so the helpers below can read it.
+
+        Idempotent and O(1) for anything that already answers ``has_node``, so
+        NetworkX callers are unaffected and repeated calls inside Yen's algorithm
+        do not rebuild the adjacency.
+        """
+        if isinstance(graph, dict) and not hasattr(graph, "has_node"):
+            return _MappingGraph(graph)
+        return graph
+
     def _node_exists(self, graph: Any, node: str) -> bool:
         """Check if node exists in graph."""
         if hasattr(graph, 'has_node'):
